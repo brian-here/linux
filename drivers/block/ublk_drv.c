@@ -79,6 +79,7 @@
 
 static_assert(PAGE_SHIFT <= UBLK_IO_BUF_BITS);
 static_assert(UBLK_NR_BUF_ORDERS <= BITS_PER_LONG);
+static_assert(UBLK_MAX_BUF_POOLS <= BITS_PER_LONG);
 
 /* All UBLK_F_* have to be included into UBLK_F_ALL */
 #define UBLK_F_ALL (UBLK_F_SUPPORT_ZERO_COPY \
@@ -241,7 +242,9 @@ struct ublk_buf_pool {
 	unsigned int	nbufs;
 	unsigned int	head;		/* consume index */
 	unsigned int	tail;		/* produce index */
-	unsigned long	compatible_orders;
+	unsigned int	idx;		/* position in ubq->buf_pools[] */
+	/* requests whose smallest fitting tier is this one, FIFO */
+	struct list_head waiters;
 	void		*kaddr;		/* base of this tier in the vmap */
 
 	struct ublk_buf	bufs[];		/* flex array */
@@ -262,7 +265,7 @@ struct ublk_io {
 	};
 	struct list_head buf_wait_node;
 	struct request *buf_wait_req;
-	u8 buf_wait_order;
+	u8 buf_wait_pool;
 	u8 buf_state;
 
 	unsigned int flags;
@@ -365,8 +368,8 @@ struct ublk_queue {
 
 	/* Buffer allocation and wait state are protected by buf_lock. */
 	spinlock_t		buf_lock;
-	struct list_head	req_buf_pending[UBLK_NR_BUF_ORDERS];
-	unsigned long		req_buf_pending_map;
+	/* bit i set: buf_pools[i]->waiters is not empty */
+	unsigned long		buf_wait_map;
 	bool			buf_stopping;
 	bool			buf_pools_registered;
 	__u64			buf_arena_addr;
@@ -533,14 +536,16 @@ static void ublk_dispatch_req_buf(struct ublk_queue *ubq,
 				  unsigned int issue_flags);
 
 /*
- * Reserve a buffer before scheduling request task work. If the selected tier
- * is exhausted, keep the started request on its order-specific wait list.
+ * Reserve a buffer before scheduling request task work.  Take the smallest
+ * tier with a free buffer that fits, starting at the request's home tier
+ * (the smallest tier that fits at all).  If every fitting tier is exhausted,
+ * keep the started request on its home tier's FIFO.
  */
 static int ublk_reserve_req_buf(struct ublk_queue *ubq, struct request *req)
 {
 	struct ublk_io *io = &ubq->ios[req->tag];
 	unsigned int order, rq_bytes;
-	struct ublk_buf_pool *pool;
+	struct ublk_buf_pool *pool, *home;
 	unsigned int i;
 	int ret = 0;
 
@@ -552,8 +557,8 @@ static int ublk_reserve_req_buf(struct ublk_queue *ubq, struct request *req)
 		return -EINVAL;
 
 	spin_lock(&ubq->buf_lock);
-	pool = ubq->buf_pool_order_map[order];
-	if (unlikely(ubq->buf_stopping || !pool ||
+	home = ubq->buf_pool_order_map[order];
+	if (unlikely(ubq->buf_stopping || !home ||
 		     io->buf_state != UBLK_BUF_NONE ||
 		     io->sel_buf_pool || io->buf_wait_req ||
 		     !list_empty(&io->buf_wait_node))) {
@@ -562,12 +567,10 @@ static int ublk_reserve_req_buf(struct ublk_queue *ubq, struct request *req)
 	}
 
 	/* Borrow the smallest currently available compatible tier. */
-	for (i = 0; i < ubq->nr_buf_pools; i++) {
+	for (i = home->idx; i < ubq->nr_buf_pools; i++) {
 		unsigned int nr_free, idx;
 
 		pool = ubq->buf_pools[i];
-		if (pool->buf_size < rq_bytes)
-			continue;
 		nr_free = pool->tail - pool->head;
 		if (WARN_ON_ONCE(nr_free > pool->nbufs)) {
 			ret = -EIO;
@@ -589,38 +592,40 @@ static int ublk_reserve_req_buf(struct ublk_queue *ubq, struct request *req)
 	}
 
 	io->buf_wait_req = req;
-	io->buf_wait_order = order;
+	io->buf_wait_pool = home->idx;
 	io->buf_state = UBLK_BUF_WAITING;
-	list_add_tail(&io->buf_wait_node, &ubq->req_buf_pending[order]);
-	__set_bit(order, &ubq->req_buf_pending_map);
+	list_add_tail(&io->buf_wait_node, &home->waiters);
+	__set_bit(home->idx, &ubq->buf_wait_map);
 	ret = -EAGAIN;
 unlock:
 	spin_unlock(&ubq->buf_lock);
 	return ret;
 }
 
+/*
+ * Pick the request a buffer returned to @pool should serve: the oldest
+ * request whose home is @pool, else the oldest borrower from the largest
+ * smaller tier with waiters.  Home waiters can only be served by @pool or a
+ * larger tier, so serving them first keeps every tier's queue moving and
+ * gives scarce large buffers to the requests with the fewest alternatives.
+ */
 static struct ublk_io *
-ublk_best_fit_waiter(struct ublk_queue *ubq, struct ublk_buf_pool *pool,
-		     unsigned int *wait_order)
+ublk_buf_pick_waiter(struct ublk_queue *ubq, struct ublk_buf_pool *pool,
+		     struct ublk_buf_pool **wait_pool)
 	__must_hold(&ubq->buf_lock)
 {
-	unsigned long orders = ubq->req_buf_pending_map &
-			       pool->compatible_orders;
-	unsigned int order;
+	unsigned long map = ubq->buf_wait_map & GENMASK(pool->idx, 0);
+	struct ublk_buf_pool *wp;
 
-	/* Preserve large buffers for the largest request only they can serve. */
-	for (order = UBLK_NR_BUF_ORDERS; order-- > 0;) {
-		if (!(orders & BIT(order)))
-			continue;
-		if (WARN_ON_ONCE(list_empty(&ubq->req_buf_pending[order]))) {
-			__clear_bit(order, &ubq->req_buf_pending_map);
-			continue;
-		}
-		*wait_order = order;
-		return list_first_entry(&ubq->req_buf_pending[order],
-					struct ublk_io, buf_wait_node);
+	if (!map)
+		return NULL;
+	wp = ubq->buf_pools[__fls(map)];
+	if (WARN_ON_ONCE(list_empty(&wp->waiters))) {
+		__clear_bit(wp->idx, &ubq->buf_wait_map);
+		return NULL;
 	}
-	return NULL;
+	*wait_pool = wp;
+	return list_first_entry(&wp->waiters, struct ublk_io, buf_wait_node);
 }
 
 static void ublk_mark_buf_in_server(struct ublk_queue *ubq,
@@ -632,7 +637,7 @@ static void ublk_mark_buf_in_server(struct ublk_queue *ubq,
 	spin_unlock(&ubq->buf_lock);
 }
 
-/* Return a buffer to the largest fitting order, FIFO within that order. */
+/* Hand a returned buffer to a waiter, or put it back on its tier's ring. */
 static void ublk_recycle_buf(struct ublk_queue *ubq, struct ublk_io *io)
 {
 	struct ublk_buf_pool *pool;
@@ -656,18 +661,17 @@ static void ublk_recycle_buf(struct ublk_queue *ubq, struct ublk_io *io)
 	io->buf_state = UBLK_BUF_NONE;
 
 	if (!ubq->buf_stopping) {
-		unsigned int order = 0;
-		struct ublk_io *waiter =
-			ublk_best_fit_waiter(ubq, pool, &order);
+		struct ublk_buf_pool *wp = NULL;
+		struct ublk_io *waiter = ublk_buf_pick_waiter(ubq, pool, &wp);
 
 		if (waiter) {
 			list_del_init(&waiter->buf_wait_node);
-			if (list_empty(&ubq->req_buf_pending[order]))
-				__clear_bit(order, &ubq->req_buf_pending_map);
+			if (list_empty(&wp->waiters))
+				__clear_bit(wp->idx, &ubq->buf_wait_map);
 			wake_req = waiter->buf_wait_req;
 			waiter->buf_wait_req = NULL;
 			if (WARN_ON_ONCE(waiter->buf_state != UBLK_BUF_WAITING ||
-					 waiter->buf_wait_order != order ||
+					 waiter->buf_wait_pool != wp->idx ||
 					 !wake_req ||
 					 pool->buf_size <
 						 blk_rq_bytes(wake_req))) {
@@ -679,7 +683,7 @@ static void ublk_recycle_buf(struct ublk_queue *ubq, struct ublk_io *io)
 				waiter->sel_buf_pool = pool;
 				waiter->buf_state = UBLK_BUF_RESERVED;
 			}
-			waiter->buf_wait_order = 0;
+			waiter->buf_wait_pool = 0;
 		}
 	}
 
@@ -706,14 +710,14 @@ static struct request *ublk_cancel_buf_wait(struct ublk_queue *ubq,
 
 	spin_lock(&ubq->buf_lock);
 	if (io->buf_state == UBLK_BUF_WAITING) {
-		unsigned int order = io->buf_wait_order;
+		struct ublk_buf_pool *wp = ubq->buf_pools[io->buf_wait_pool];
 
 		list_del_init(&io->buf_wait_node);
-		if (list_empty(&ubq->req_buf_pending[order]))
-			__clear_bit(order, &ubq->req_buf_pending_map);
+		if (list_empty(&wp->waiters))
+			__clear_bit(wp->idx, &ubq->buf_wait_map);
 		req = io->buf_wait_req;
 		io->buf_wait_req = NULL;
-		io->buf_wait_order = 0;
+		io->buf_wait_pool = 0;
 		io->buf_state = UBLK_BUF_NONE;
 	}
 	spin_unlock(&ubq->buf_lock);
@@ -2806,7 +2810,7 @@ static void ublk_queue_reinit(struct ublk_device *ub, struct ublk_queue *ubq)
 		memset(&io->sel_buf, 0, sizeof(io->sel_buf));
 		io->sel_buf_pool = NULL;
 		io->buf_wait_req = NULL;
-		io->buf_wait_order = 0;
+		io->buf_wait_pool = 0;
 		io->buf_state = UBLK_BUF_NONE;
 		INIT_LIST_HEAD(&io->buf_wait_node);
 	}
@@ -3128,18 +3132,19 @@ static void __ublk_fail_req(struct ublk_device *ub, struct ublk_io *io,
 static void ublk_abort_buf_waiters(struct ublk_queue *ubq)
 {
 	struct ublk_io *io, *tmp;
-	unsigned int order;
+	unsigned int i;
 	LIST_HEAD(waiters);
 
 	spin_lock(&ubq->buf_lock);
 	ubq->buf_stopping = true;
-	for (order = 0; order < UBLK_NR_BUF_ORDERS; order++) {
-		list_for_each_entry(io, &ubq->req_buf_pending[order],
-				    buf_wait_node)
+	for (i = 0; i < ubq->nr_buf_pools; i++) {
+		struct ublk_buf_pool *pool = ubq->buf_pools[i];
+
+		list_for_each_entry(io, &pool->waiters, buf_wait_node)
 			io->buf_state = UBLK_BUF_NONE;
-		list_splice_tail_init(&ubq->req_buf_pending[order], &waiters);
+		list_splice_tail_init(&pool->waiters, &waiters);
 	}
-	ubq->req_buf_pending_map = 0;
+	ubq->buf_wait_map = 0;
 	spin_unlock(&ubq->buf_lock);
 
 	list_for_each_entry_safe(io, tmp, &waiters, buf_wait_node) {
@@ -3147,7 +3152,7 @@ static void ublk_abort_buf_waiters(struct ublk_queue *ubq)
 
 		list_del_init(&io->buf_wait_node);
 		io->buf_wait_req = NULL;
-		io->buf_wait_order = 0;
+		io->buf_wait_pool = 0;
 		if (req)
 			__ublk_abort_rq(ubq, req);
 	}
@@ -3845,8 +3850,8 @@ static bool ublk_get_data(const struct ublk_queue *ubq, struct ublk_io *io,
 }
 
 /*
- * Build buf_pool_order_map[] from the sorted buf_pools[] array.
- * For each page order, map it to the smallest pool whose buf_size covers
+ * Build buf_pool_order_map[] from the sorted buf_pools[] array: map each
+ * page order to its home tier, the smallest pool whose buf_size covers
  * that order.  buf_pools[] is sorted ascending by buf_size, so walk
  * backwards from the largest pool to fill in all orders it covers.
  */
@@ -3855,19 +3860,9 @@ static void ublk_build_buf_pool_map(struct ublk_queue *ubq)
 	int i, order;
 
 	memset(ubq->buf_pool_order_map, 0, sizeof(ubq->buf_pool_order_map));
-	for (i = 0; i < ubq->nr_buf_pools; i++)
-		ubq->buf_pools[i]->compatible_orders = 0;
-
-	/*
-	 * Fill from largest pool down: each pool covers its own order and
-	 * all smaller orders, so the smallest fitting pool wins.
-	 */
 	for (i = ubq->nr_buf_pools - 1; i >= 0; i--) {
 		struct ublk_buf_pool *pool = ubq->buf_pools[i];
 		unsigned int pool_order = get_order(pool->buf_size);
-
-		for (order = 0; order <= pool_order; order++)
-			__set_bit(order, &pool->compatible_orders);
 
 		for (order = 0; order <= pool_order; order++)
 			ubq->buf_pool_order_map[order] = pool;
@@ -4066,6 +4061,8 @@ static int ublk_register_buf_pools(struct io_uring_cmd *cmd,
 		pool->buf_size = desc->buf_size;
 		pool->nbufs = desc->nr_bufs;
 		pool->tail = desc->nr_bufs;
+		pool->idx = i;
+		INIT_LIST_HEAD(&pool->waiters);
 		for (j = 0; j < desc->nr_bufs; j++) {
 			pool->bufs[j].user_addr = cfg.addr + desc->offset +
 						    (u64)j * desc->buf_size;
@@ -5031,9 +5028,6 @@ static int ublk_init_queue(struct ublk_device *ub, int q_id)
 		spin_lock_init(&ubq->ios[i].lock);
 		INIT_LIST_HEAD(&ubq->ios[i].buf_wait_node);
 	}
-
-	for (i = 0; i < UBLK_NR_BUF_ORDERS; i++)
-		INIT_LIST_HEAD(&ubq->req_buf_pending[i]);
 
 	if (ublk_dev_support_batch_io(ub)) {
 		ret = ublk_io_evts_init(ubq, ubq->q_depth, numa_node);

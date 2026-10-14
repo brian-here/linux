@@ -439,8 +439,10 @@ struct ublk_shmem_buf_reg {
  * via UBLK_U_IO_REGISTER_BUF_POOLS before START_DEV. At request admission
  * the kernel reserves the smallest currently available buffer that fits,
  * borrowing from a larger tier when needed. This eliminates the need for
- * max-sized buffers on every IO tag. A returned buffer first serves the
- * largest waiting size it can satisfy, preserving scarce large buffers.
+ * max-sized buffers on every IO tag. A request that finds no free buffer
+ * waits, in arrival order, on its home tier (the smallest tier that fits
+ * it). A returned buffer serves its own tier's queue first and otherwise
+ * the queue of the largest smaller tier with waiters.
  *
  * The initial implementation is limited to the ordinary non-batch copy
  * path. It is mutually exclusive with batch I/O, user/zero-copy modes,
