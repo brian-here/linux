@@ -272,10 +272,16 @@ struct ublk_buf {
 	unsigned int	id;		/* index within its pool */
 };
 
-/* Buffer pool: manages a set of same-sized buffers for one queue */
+/*
+ * Buffer pool: manages a set of same-sized buffers for one queue.
+ *
+ * bufs[] is a ring of free buffers.  head and tail run freely and are masked
+ * with nbufs - 1; nbufs is a power of two, so the slot sequence stays
+ * continuous when the counters wrap at 2^32.
+ */
 struct ublk_buf_pool {
 	unsigned int	buf_size;
-	unsigned int	nbufs;
+	unsigned int	nbufs;		/* power of two */
 	unsigned int	head;		/* consume index */
 	unsigned int	tail;		/* produce index */
 	unsigned int	idx;		/* position in ubq->buf_pools[] */
@@ -978,7 +984,7 @@ static int ublk_reserve_req_buf(struct ublk_queue *ubq, struct request *req)
 		}
 		if (!nr_free)
 			continue;
-		idx = pool->head % pool->nbufs;
+		idx = pool->head & (pool->nbufs - 1);
 		if (WARN_ON_ONCE(pool->bufs[idx].id >= pool->nbufs ||
 				 pool->bufs[idx].len != pool->buf_size)) {
 			ret = -EIO;
@@ -1090,7 +1096,7 @@ static void ublk_recycle_buf(struct ublk_queue *ubq, struct ublk_io *io)
 	if (!wake_req) {
 		if (WARN_ON_ONCE(pool->tail - pool->head >= pool->nbufs))
 			goto unlock;
-		pool->bufs[pool->tail % pool->nbufs] = buf;
+		pool->bufs[pool->tail & (pool->nbufs - 1)] = buf;
 		pool->tail++;
 	}
 unlock:
@@ -5067,7 +5073,8 @@ static int ublk_register_buf_pools(struct io_uring_cmd *cmd,
 		const struct ublk_buf_pool_desc *desc = &cfg.pools[i];
 		u64 tier_len;
 
-		if (!desc->buf_size || !desc->nr_bufs ||
+		/* power-of-two counts keep the free ring correct across wrap */
+		if (!desc->buf_size || !is_power_of_2(desc->nr_bufs) ||
 		    !PAGE_ALIGNED(desc->buf_size) ||
 		    !is_power_of_2(desc->buf_size) ||
 		    desc->buf_size > (1U << UBLK_IO_BUF_BITS) ||
