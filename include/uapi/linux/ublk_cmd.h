@@ -738,7 +738,7 @@ struct ublk_batch_io {
 struct ublk_buf_pool_desc {
 	__u64	offset;		/* byte offset from arena base */
 	__u32	buf_size;	/* bytes per buffer */
-	__u32	nr_bufs;	/* number of buffers in this tier */
+	__u32	nr_bufs;	/* buffers in this tier, a power of two */
 };
 
 /*
